@@ -18,6 +18,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	apiURL := os.Getenv("LOGTAIL_API_URL")
+	if apiURL == "" {
+		fmt.Println("Please set LOGTAIL_API_URL environment variable")
+		os.Exit(1)
+	}
+
 	encoderConfig := zap.NewProductionEncoderConfig()
 	encoderConfig.TimeKey = "timestamp"
 	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
@@ -31,6 +37,7 @@ func main() {
 
 	config := zaptail.Config{
 		APIKey:        apiKey,
+		LogtailURL:    apiURL,
 		BatchSize:     10,
 		FlushInterval: 3 * time.Second,
 	}
@@ -66,7 +73,7 @@ func main() {
 		zap.Int("retry_count", 3),
 	)
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		logger.Info("Processing batch",
 			zap.Int("batch_number", i+1),
 			zap.Int("records", (i+1)*100),

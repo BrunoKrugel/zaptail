@@ -11,22 +11,19 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-const (
-	logtailURL = "https://in.logtail.com"
-)
-
 type Config struct {
-	APIKey     string
-	BatchSize  int
+	APIKey        string
+	LogtailURL    string
+	BatchSize     int
 	FlushInterval time.Duration
-	HTTPClient *http.Client
+	HTTPClient    *http.Client
 }
 
 type Core struct {
 	zapcore.LevelEnabler
 	encoder zapcore.Encoder
 	config  Config
-	buffer  []map[string]interface{}
+	buffer  []map[string]any
 	mu      sync.Mutex
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
@@ -49,7 +46,7 @@ func NewCore(enc zapcore.Encoder, enab zapcore.LevelEnabler, config Config) *Cor
 		LevelEnabler: enab,
 		encoder:      enc,
 		config:       config,
-		buffer:       make([]map[string]interface{}, 0, config.BatchSize),
+		buffer:       make([]map[string]any, 0, config.BatchSize),
 		stopCh:       make(chan struct{}),
 	}
 
@@ -82,7 +79,7 @@ func (c *Core) Write(entry zapcore.Entry, fields []zapcore.Field) error {
 	}
 	defer buf.Free()
 
-	var logEntry map[string]interface{}
+	var logEntry map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &logEntry); err != nil {
 		return err
 	}
@@ -144,7 +141,7 @@ func (c *Core) flush() error {
 		return nil
 	}
 
-	logs := make([]map[string]interface{}, len(c.buffer))
+	logs := make([]map[string]any, len(c.buffer))
 	copy(logs, c.buffer)
 	c.buffer = c.buffer[:0]
 	c.mu.Unlock()
@@ -152,7 +149,7 @@ func (c *Core) flush() error {
 	return c.sendToLogtail(logs)
 }
 
-func (c *Core) sendToLogtail(logs []map[string]interface{}) error {
+func (c *Core) sendToLogtail(logs []map[string]any) error {
 	if len(logs) == 0 {
 		return nil
 	}
@@ -162,7 +159,7 @@ func (c *Core) sendToLogtail(logs []map[string]interface{}) error {
 		return fmt.Errorf("failed to marshal logs: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", logtailURL, bytes.NewReader(payload))
+	req, err := http.NewRequest("POST", c.config.LogtailURL, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
