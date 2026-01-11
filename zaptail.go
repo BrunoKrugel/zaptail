@@ -2,6 +2,7 @@ package zaptail
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,21 +13,21 @@ import (
 )
 
 type Config struct {
+	HTTPClient    *http.Client
 	APIKey        string
 	LogtailURL    string
 	BatchSize     int
 	FlushInterval time.Duration
-	HTTPClient    *http.Client
 }
 
 type Core struct {
 	zapcore.LevelEnabler
 	encoder zapcore.Encoder
-	config  Config
-	buffer  []map[string]any
-	mu      sync.Mutex
 	stopCh  chan struct{}
+	buffer  []map[string]any
+	config  Config
 	wg      sync.WaitGroup
+	mu      sync.Mutex
 }
 
 func NewCore(enc zapcore.Encoder, enab zapcore.LevelEnabler, config Config) *Core {
@@ -65,6 +66,7 @@ func (c *Core) With(fields []zapcore.Field) zapcore.Core {
 	return clone
 }
 
+//nolint:gocritic // Implements zapcore.Core interface
 func (c *Core) Check(entry zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
 	if c.Enabled(entry.Level) {
 		return ce.AddCore(entry, c)
@@ -72,6 +74,7 @@ func (c *Core) Check(entry zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.Che
 	return ce
 }
 
+//nolint:gocritic // Implements zapcore.Core interface
 func (c *Core) Write(entry zapcore.Entry, fields []zapcore.Field) error {
 	buf, err := c.encoder.EncodeEntry(entry, fields)
 	if err != nil {
@@ -159,7 +162,7 @@ func (c *Core) sendToLogtail(logs []map[string]any) error {
 		return fmt.Errorf("failed to marshal logs: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.config.LogtailURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.config.LogtailURL, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
