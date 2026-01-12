@@ -1,0 +1,70 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+# For Go libraries, we typically don't need binary builds
+# Instead, we focus on source code releases and proper tagging
+builds:
+  - skip: true
+
+# Skip archives since this is a library, not a binary distribution
+archives:
+  - formats: [tar.gz]
+    files:
+      - none*
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+  groups:
+    - title: Features
+      regexp: "^.*feat[(\\w)]*:+.*$"
+      order: 0
+    - title: 'Bug fixes'
+      regexp: "^.*fix[(\\w)]*:+.*$"
+      order: 1
+    - title: Others
+      order: 999
+
+release:
+  github:
+    owner: BrunoKrugel
+    name: zaptail
+  draft: false
+  prerelease: auto
+  mode: replace
+  header: |
+    ## zaptail {{ .Tag }}
+
+    This release contains the latest version of zaptail, a Go library for sending logs to BetterStack Logtail.
+
+    ### Installation
+
+    ```bash
+    go get github.com/BrunoKrugel/zaptail@{{ .Tag }}
+    ```
+
+  footer: |
+    ## Usage
+
+    Import the library in your Go project:
+
+    ```go
+    import "github.com/BrunoKrugel/zaptail"
+    ```
+
+    ---
+
+    **Full Changelog**: https://github.com/BrunoKrugel/zaptail/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+    Released by [GoReleaser](https://github.com/goreleaser/goreleaser).
