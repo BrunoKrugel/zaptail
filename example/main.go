@@ -35,14 +35,16 @@ func main() {
 		zapcore.DebugLevel,
 	)
 
-	config := zaptail.Config{
+	logtailCore, err := zaptail.NewCore(encoder, zapcore.InfoLevel, &zaptail.Config{
 		APIKey:        apiKey,
 		LogtailURL:    apiURL,
 		BatchSize:     10,
 		FlushInterval: 3 * time.Second,
+	})
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
 	}
-
-	logtailCore := zaptail.NewCore(encoder, zapcore.InfoLevel, config)
 	defer logtailCore.Close()
 
 	core := zapcore.NewTee(consoleCore, logtailCore)

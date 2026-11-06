@@ -1,65 +1,138 @@
+// Package zaptail provides a zapcore.Core that batches log entries and ships
+// them asynchronously to Better Stack Logtail over HTTP.
 package zaptail
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
 	"go.uber.org/zap/zapcore"
 )
 
+const (
+	defaultBatchSize     = 100
+	defaultFlushInterval = 5 * time.Second
+	defaultHTTPTimeout   = 10 * time.Second
+	bufferMultiplier     = 10
+	maxSendAttempts      = 3
+	retryBackoff         = 200 * time.Millisecond
+)
+
 type Config struct {
-	HTTPClient    *http.Client
-	APIKey        string
-	LogtailURL    string
-	BatchSize     int
-	FlushInterval time.Duration
+	HTTPClient      *http.Client
+	Context         context.Context
+	ErrorOutput     zapcore.WriteSyncer
+	APIKey          string
+	LogtailURL      string
+	BatchSize       int
+	MaxBufferedLogs int
+	FlushInterval   time.Duration
+}
+
+func (c *Config) validate() error {
+	if c.APIKey == "" {
+		return errors.New("zaptail: APIKey is required")
+	}
+	if c.LogtailURL == "" {
+		return errors.New("zaptail: LogtailURL is required")
+	}
+	if parsed, err := url.Parse(c.LogtailURL); err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("zaptail: invalid LogtailURL %q", c.LogtailURL)
+	}
+	if c.BatchSize < 0 {
+		return errors.New("zaptail: BatchSize must not be negative")
+	}
+	if c.MaxBufferedLogs < 0 {
+		return errors.New("zaptail: MaxBufferedLogs must not be negative")
+	}
+	if c.FlushInterval < 0 {
+		return errors.New("zaptail: FlushInterval must not be negative")
+	}
+	return nil
+}
+
+type sink struct {
+	ctx       context.Context
+	flushCh   chan struct{}
+	stopCh    chan struct{}
+	buffer    []map[string]any
+	config    Config
+	wg        sync.WaitGroup
+	dropped   int
+	bufferCap int
+	closeOnce sync.Once
+	mu        sync.Mutex
+	reportMu  sync.Mutex
 }
 
 type Core struct {
 	zapcore.LevelEnabler
-	encoder zapcore.Encoder
-	stopCh  chan struct{}
-	buffer  []map[string]any
-	config  Config
-	wg      sync.WaitGroup
-	mu      sync.Mutex
+	*sink
+	encoder  zapcore.Encoder
+	ownsSink bool
 }
 
-func NewCore(enc zapcore.Encoder, enab zapcore.LevelEnabler, config Config) *Core {
-	if config.BatchSize == 0 {
-		config.BatchSize = 100
+func NewCore(encoder zapcore.Encoder, enabler zapcore.LevelEnabler, config *Config) (*Core, error) {
+	if encoder == nil {
+		return nil, errors.New("zaptail: encoder is required")
 	}
-	if config.FlushInterval == 0 {
-		config.FlushInterval = 5 * time.Second
+	if enabler == nil {
+		return nil, errors.New("zaptail: level enabler is required")
 	}
-	if config.HTTPClient == nil {
-		config.HTTPClient = &http.Client{
-			Timeout: 10 * time.Second,
-		}
+	if config == nil {
+		return nil, errors.New("zaptail: config is required")
 	}
-
-	core := &Core{
-		LevelEnabler: enab,
-		encoder:      enc,
-		config:       config,
-		buffer:       make([]map[string]any, 0, config.BatchSize),
-		stopCh:       make(chan struct{}),
+	if err := config.validate(); err != nil {
+		return nil, err
 	}
 
-	core.wg.Add(1)
-	go core.flushWorker()
+	settings := *config
+	if settings.BatchSize == 0 {
+		settings.BatchSize = defaultBatchSize
+	}
+	if settings.FlushInterval == 0 {
+		settings.FlushInterval = defaultFlushInterval
+	}
+	if settings.HTTPClient == nil {
+		settings.HTTPClient = &http.Client{Timeout: defaultHTTPTimeout}
+	}
+	ctx := settings.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	return core
+	shipped := &sink{
+		config:    settings,
+		ctx:       ctx,
+		buffer:    make([]map[string]any, 0, settings.BatchSize),
+		bufferCap: settings.MaxBufferedLogs,
+		flushCh:   make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+	}
+	if shipped.bufferCap == 0 {
+		shipped.bufferCap = settings.BatchSize * bufferMultiplier
+	}
+
+	shipped.wg.Add(1)
+	go shipped.worker()
+
+	return &Core{LevelEnabler: enabler, sink: shipped, encoder: encoder, ownsSink: true}, nil
 }
 
 func (c *Core) With(fields []zapcore.Field) zapcore.Core {
-	clone := c.clone()
-	clone.encoder = c.encoder.Clone()
+	clone := &Core{
+		LevelEnabler: c.LevelEnabler,
+		sink:         c.sink,
+		encoder:      c.encoder.Clone(),
+	}
 	for _, field := range fields {
 		field.AddTo(clone.encoder)
 	}
@@ -86,18 +159,11 @@ func (c *Core) Write(entry zapcore.Entry, fields []zapcore.Field) error {
 	if err := json.Unmarshal(buf.Bytes(), &logEntry); err != nil {
 		return err
 	}
-
-	logEntry["dt"] = entry.Time.Format(time.RFC3339Nano)
-
-	c.mu.Lock()
-	c.buffer = append(c.buffer, logEntry)
-	shouldFlush := len(c.buffer) >= c.config.BatchSize
-	c.mu.Unlock()
-
-	if shouldFlush {
-		return c.flush()
+	if _, exists := logEntry["dt"]; !exists {
+		logEntry["dt"] = entry.Time.Format(time.RFC3339Nano)
 	}
 
+	c.sink.append(logEntry)
 	return nil
 }
 
@@ -106,79 +172,142 @@ func (c *Core) Sync() error {
 }
 
 func (c *Core) Close() error {
-	close(c.stopCh)
-	c.wg.Wait()
+	if c.ownsSink {
+		c.closeOnce.Do(func() {
+			close(c.stopCh)
+			c.wg.Wait()
+		})
+	}
 	return c.flush()
 }
 
-func (c *Core) clone() *Core {
-	return &Core{
-		LevelEnabler: c.LevelEnabler,
-		encoder:      c.encoder.Clone(),
-		config:       c.config,
-		buffer:       c.buffer,
-		mu:           sync.Mutex{},
-		stopCh:       c.stopCh,
-	}
-}
-
-func (c *Core) flushWorker() {
-	defer c.wg.Done()
-	ticker := time.NewTicker(c.config.FlushInterval)
+func (s *sink) worker() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(s.config.FlushInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			c.flush()
-		case <-c.stopCh:
+			_ = s.flush()
+		case <-s.flushCh:
+			_ = s.flush()
+		case <-s.stopCh:
 			return
 		}
 	}
 }
 
-func (c *Core) flush() error {
-	c.mu.Lock()
-	if len(c.buffer) == 0 {
-		c.mu.Unlock()
-		return nil
+func (s *sink) append(entry map[string]any) {
+	s.mu.Lock()
+	if len(s.buffer) >= s.bufferCap {
+		s.dropped++
+		s.mu.Unlock()
+		return
 	}
+	s.buffer = append(s.buffer, entry)
+	full := len(s.buffer) >= s.config.BatchSize
+	s.mu.Unlock()
 
-	logs := make([]map[string]any, len(c.buffer))
-	copy(logs, c.buffer)
-	c.buffer = c.buffer[:0]
-	c.mu.Unlock()
-
-	return c.sendToLogtail(logs)
+	if full {
+		s.signalFlush()
+	}
 }
 
-func (c *Core) sendToLogtail(logs []map[string]any) error {
-	if len(logs) == 0 {
+func (s *sink) signalFlush() {
+	select {
+	case s.flushCh <- struct{}{}:
+	default:
+	}
+}
+
+func (s *sink) flush() error {
+	s.mu.Lock()
+	batch := s.buffer
+	s.buffer = make([]map[string]any, 0, s.config.BatchSize)
+	dropped := s.dropped
+	s.dropped = 0
+	s.mu.Unlock()
+
+	if dropped > 0 {
+		s.report(fmt.Sprintf("log buffer full; dropped %d logs", dropped))
+	}
+	if len(batch) == 0 {
 		return nil
 	}
 
-	payload, err := json.Marshal(logs)
+	if err := s.sendWithRetry(batch); err != nil {
+		s.report(fmt.Sprintf("dropping %d logs: %v", len(batch), err))
+		return err
+	}
+	return nil
+}
+
+func (s *sink) sendWithRetry(batch []map[string]any) error {
+	var lastErr error
+	attempts := 0
+	for attempts < maxSendAttempts {
+		if err := s.ctx.Err(); err != nil {
+			return fmt.Errorf("delivery cancelled: %w", err)
+		}
+		lastErr = s.send(batch)
+		if lastErr == nil {
+			return nil
+		}
+		attempts++
+		if attempts < maxSendAttempts && !s.wait(retryBackoff<<(attempts-1)) {
+			break
+		}
+	}
+	return fmt.Errorf("send failed after %d attempts: %w", attempts, lastErr)
+}
+
+func (s *sink) wait(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-s.stopCh:
+		return false
+	case <-s.ctx.Done():
+		return false
+	}
+}
+
+func (s *sink) send(batch []map[string]any) error {
+	payload, err := json.Marshal(batch)
 	if err != nil {
-		return fmt.Errorf("failed to marshal logs: %w", err)
+		return fmt.Errorf("marshal logs: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.config.LogtailURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost, s.config.LogtailURL, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("create request: %w", err)
 	}
-
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+	req.Header.Set("Authorization", "Bearer "+s.config.APIKey)
 
-	resp, err := c.config.HTTPClient.Do(req)
+	resp, err := s.config.HTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to send logs: %w", err)
+		return fmt.Errorf("send logs: %w", err)
 	}
 	defer resp.Body.Close()
+
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		return fmt.Errorf("logtail returned status %d", resp.StatusCode)
 	}
-
 	return nil
+}
+
+func (s *sink) report(message string) {
+	if s.config.ErrorOutput == nil {
+		return
+	}
+	s.reportMu.Lock()
+	defer s.reportMu.Unlock()
+	_, _ = fmt.Fprintf(s.config.ErrorOutput, "zaptail: %s\n", message)
 }
