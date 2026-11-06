@@ -85,10 +85,6 @@ linters:
         - require-error # This ensure the test finish even if we had an error
         - float-compare # Too many magic numbers in float comparisons
 
-    cyclop:
-      max-complexity: 15
-      package-average: 10.0 # The maximal average package complexity.
-
     errcheck:
       check-type-assertions: true
 
@@ -148,26 +144,6 @@ linters:
 
     perfsprint:
       strconcat: false # Optimizes into strings concatenation.
-
-    mnd:
-      # List of function patterns to exclude from analysis.
-      # Values always ignored: `time.Date`,
-      # `strconv.FormatInt`, `strconv.FormatUint`, `strconv.FormatFloat`,
-      # `strconv.ParseInt`, `strconv.ParseUint`, `strconv.ParseFloat`.
-      # Default: []
-      ignored-functions:
-        - args.Error
-        - flag.Arg
-        - flag.Duration.*
-        - flag.Float.*
-        - flag.Int.*
-        - flag.Uint.*
-        - os.Chmod
-        - os.Mkdir.*
-        - os.OpenFile
-        - os.WriteFile
-        - prometheus.ExponentialBuckets.*
-        - prometheus.LinearBuckets
 
     staticcheck:
       checks:
